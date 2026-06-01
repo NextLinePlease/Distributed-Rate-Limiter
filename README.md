@@ -19,7 +19,7 @@ Prerequisites: Docker (Running local Redis instance on port 6379), GCC compiler.
 
 ```powershell
 # Clone the repository
-git clone [https://github.com/NextLinePlease/Distributed-Rate-Limiter.git](https://github.com/YOUR_USERNAME/Distributed-Rate-Limiter.git)
+git clone [https://github.com/NextLinePlease/Distributed-Rate-Limiter.git](https://github.com/NextLinePlease/Distributed-Rate-Limiter.git)
 cd Distributed-Rate-Limiter
 
 # Compile and execute the live simulation harness
