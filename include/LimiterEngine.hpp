@@ -15,18 +15,16 @@ class RedisConnection
 {
 public:
     SOCKET sock;
-    std::string token_bucket_sha;
-    std::string security_sha;
-    std::string telemetry_sha;
+    std::string bucket_sha;
+    std::string sec_sha;
+    std::string telem_sha;
 
-    RedisConnection() : sock(INVALID_SOCKET), token_bucket_sha(""), security_sha(""), telemetry_sha("") {}
+    RedisConnection() : sock(INVALID_SOCKET), bucket_sha(""), sec_sha(""), telem_sha("") {}
 
     ~RedisConnection()
     {
         if (sock != INVALID_SOCKET)
-        {
             closesocket(sock);
-        }
     }
 
     bool connect_to_node(const std::string &ip, int port)
@@ -34,21 +32,21 @@ public:
         sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (sock == INVALID_SOCKET)
             return false;
-        sockaddr_in target;
-        target.sin_family = AF_INET;
-        target.sin_port = htons(port);
-        target.sin_addr.s_addr = inet_addr(ip.c_str());
-        return (connect(sock, (SOCKADDR *)&target, sizeof(target)) != SOCKET_ERROR);
+        sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        addr.sin_addr.s_addr = inet_addr(ip.c_str());
+        return (connect(sock, (SOCKADDR *)&addr, sizeof(addr)) != SOCKET_ERROR);
     }
 
     void send_resp(const std::vector<std::string> &args)
     {
-        std::string payload = "*" + std::to_string(args.size()) + "\r\n";
+        std::string req = "*" + std::to_string(args.size()) + "\r\n";
         for (const auto &arg : args)
         {
-            payload += "$" + std::to_string(arg.length()) + "\r\n" + arg + "\r\n";
+            req += "$" + std::to_string(arg.length()) + "\r\n" + arg + "\r\n";
         }
-        send(sock, payload.c_str(), payload.length(), 0);
+        send(sock, req.c_str(), req.length(), 0);
     }
 
     std::string read_resp()
@@ -75,117 +73,92 @@ public:
 class LimiterEngine
 {
 private:
-    std::string node_ip;
-    int node_port;
-    int max_pool_size;
-    std::vector<RedisConnection *> connection_storage_pool;
-    CRITICAL_SECTION pool_lock;
+    std::string ip;
+    int port;
+    int pool_size;
+    std::vector<RedisConnection *> conns;
+    CRITICAL_SECTION lock;
 
-    CircuitState circuit_state;
-    std::chrono::steady_clock::time_point state_changed_time;
-    std::unordered_map<std::string, ClientProfile> local_cache;
+    CircuitState state;
+    std::chrono::steady_clock::time_point last_state_change;
+    std::unordered_map<std::string, ClientProfile> fallback_cache;
 
     bool load_scripts(RedisConnection *conn)
     {
         if (!conn)
             return false;
 
-        std::string script_bucket =
-            "local user_key = KEYS[1] local config_key = KEYS[2] "
-            "local cfg = redis.call('HMGET', config_key, 'capacity', 'refill_rate') "
-            "local max_capacity = tonumber(cfg[1]) or 2.0 "
-            "local refill_rate = tonumber(cfg[2]) or 0.1 "
-            "local now = tonumber(ARGV[1]) "
-            "local data = redis.call('HMGET', user_key, 'tokens', 'last_updated') "
-            "local tokens = tonumber(data[1]) "
-            "local last_updated = tonumber(data[2]) "
-            "if not tokens then tokens = max_capacity last_updated = now "
-            "else local elapsed = math.max(0, now - last_updated) "
-            "tokens = math.min(max_capacity, tokens + (elapsed * refill_rate)) end "
-            "if tokens >= 1.0 then "
-            "redis.call('HMSET', user_key, 'tokens', tokens - 1.0, 'last_updated', now) "
-            "redis.call('EXPIRE', user_key, 60) return 1 "
-            "else redis.call('HMSET', user_key, 'tokens', tokens, 'last_updated', now) return 0 end";
+        std::string lua_bucket =
+            "local k,c=KEYS[1],KEYS[2] local cfg=redis.call('HMGET',c,'capacity','refill_rate') "
+            "local cap,rate=tonumber(cfg[1]) or 2.0,tonumber(cfg[2]) or 0.1 local now=tonumber(ARGV[1]) "
+            "local d=redis.call('HMGET',k,'tokens','last_updated') local t,lu=tonumber(d[1]),tonumber(d[2]) "
+            "if not t then t=cap lu=now else local el=math.max(0,now-lu) t=math.min(cap,t+(el*rate)) end "
+            "if t>=1.0 then redis.call('HMSET',k,'tokens',t-1.0,'last_updated',now) redis.call('EXPIRE',k,60) return 1 "
+            "else redis.call('HMSET',k,'tokens',t,'last_updated',now) return 0 end";
 
-        std::string script_security =
-            "local r_key = KEYS[1] local b_key = KEYS[2] local v_key = KEYS[3] "
-            "local now, cap, rate, thresh, dur = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), tonumber(ARGV[4]), tonumber(ARGV[5]) "
-            "if redis.call('EXISTS', b_key) == 1 then return -1 end "
-            "local data = redis.call('HMGET', r_key, 'tokens', 'last_updated') "
-            "local tokens = tonumber(data[1]) or cap "
-            "local last_updated = tonumber(data[2]) or now "
-            "local elapsed = math.max(0, now - last_updated) "
-            "tokens = math.min(cap, tokens + (elapsed * rate)) "
-            "if tokens >= 1.0 then "
-            "redis.call('HMSET', r_key, 'tokens', tokens - 1.0, 'last_updated', now) return 1 "
-            "else "
-            "redis.call('HMSET', r_key, 'tokens', tokens, 'last_updated', now) "
-            "local viols = redis.call('INCR', v_key) redis.call('EXPIRE', v_key, 20) "
-            "if viols >= thresh then redis.call('SET', b_key, '1') redis.call('EXPIRE', b_key, dur) redis.call('DEL', v_key) return -1 end "
-            "return 0 end";
+        std::string lua_sec =
+            "local r,b,v=KEYS[1],KEYS[2],KEYS[3] local now,cap,rate,th,dur=tonumber(ARGV[1]),tonumber(ARGV[2]),tonumber(ARGV[3]),tonumber(ARGV[4]),tonumber(ARGV[5]) "
+            "if redis.call('EXISTS',b)==1 then return -1 end local d=redis.call('HMGET',r,'tokens','last_updated') "
+            "local t,lu=tonumber(d[1]) or cap,tonumber(d[2]) or now local el=math.max(0,now-lu) t=math.min(cap,t+(el*rate)) "
+            "if t>=1.0 then redis.call('HMSET',r,'tokens',t-1.0,'last_updated',now) return 1 "
+            "else redis.call('HMSET',r,'tokens',t,'last_updated',now) local viols=redis.call('INCR',v) redis.call('EXPIRE',v,20) "
+            "if viols>=th then redis.call('SET',b,'1') redis.call('EXPIRE',b,dur) redis.call('DEL',v) return -1 end return 0 end";
 
-        std::string script_telemetry =
-            "local r_key = KEYS[1] local q_key = KEYS[2] "
-            "local cid, now, cap, rate = ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3]), tonumber(ARGV[4]) "
-            "local data = redis.call('HMGET', r_key, 'tokens', 'last_updated') "
-            "local tokens = tonumber(data[1]) or cap "
-            "local last_updated = tonumber(data[2]) or now "
-            "local elapsed = math.max(0, now - last_updated) "
-            "tokens = math.min(cap, tokens + (elapsed * rate)) "
-            "local status = 'REJECTED' local ret = 0 "
-            "if tokens >= 1.0 then tokens = tokens - 1.0 status = 'ALLOWED' ret = 1 end "
-            "redis.call('HMSET', r_key, 'tokens', tokens, 'last_updated', now) "
-            "redis.call('LPUSH', q_key, now .. ',' .. cid .. ',' .. status) "
-            "redis.call('LTRIM', q_key, 0, 999) return ret";
+        std::string lua_telem =
+            "local r,q=KEYS[1],KEYS[2] local cid,now,cap,rate=ARGV[1],tonumber(ARGV[2]),tonumber(ARGV[3]),tonumber(ARGV[4]) "
+            "local d=redis.call('HMGET',r,'tokens','last_updated') local t,lu=tonumber(d[1]) or cap,tonumber(d[2]) or now "
+            "local el=math.max(0,now-lu) t=math.min(cap,t+(el*rate)) local status,ret='REJECTED',0 "
+            "if t>=1.0 then t=t-1.0 status='ALLOWED' ret=1 end redis.call('HMSET',r,'tokens',t,'last_updated',now) "
+            "redis.call('LPUSH',q,now..','..cid..','..status) redis.call('LTRIM',q,0,999) return ret";
 
-        conn->send_resp({"SCRIPT", "LOAD", script_bucket});
-        conn->token_bucket_sha = conn->parse_bulk(conn->read_resp());
+        conn->send_resp({"SCRIPT", "LOAD", lua_bucket});
+        conn->bucket_sha = conn->parse_bulk(conn->read_resp());
 
-        conn->send_resp({"SCRIPT", "LOAD", script_security});
-        conn->security_sha = conn->parse_bulk(conn->read_resp());
+        conn->send_resp({"SCRIPT", "LOAD", lua_sec});
+        conn->sec_sha = conn->parse_bulk(conn->read_resp());
 
-        conn->send_resp({"SCRIPT", "LOAD", script_telemetry});
-        conn->telemetry_sha = conn->parse_bulk(conn->read_resp());
+        conn->send_resp({"SCRIPT", "LOAD", lua_telem});
+        conn->telem_sha = conn->parse_bulk(conn->read_resp());
 
-        return (!conn->token_bucket_sha.empty() && !conn->security_sha.empty() && !conn->telemetry_sha.empty());
+        return (!conn->bucket_sha.empty() && !conn->sec_sha.empty() && !conn->telem_sha.empty());
     }
 
-    RedisConnection *acquire()
+    RedisConnection *pop_conn()
     {
-        EnterCriticalSection(&pool_lock);
-        if (connection_storage_pool.empty() || circuit_state == OPEN)
+        EnterCriticalSection(&lock);
+        if (conns.empty() || state == OPEN)
         {
-            LeaveCriticalSection(&pool_lock);
+            LeaveCriticalSection(&lock);
             return nullptr;
         }
-        RedisConnection *conn = connection_storage_pool.back();
-        connection_storage_pool.pop_back();
-        LeaveCriticalSection(&pool_lock);
+        RedisConnection *conn = conns.back();
+        conns.pop_back();
+        LeaveCriticalSection(&lock);
         return conn;
     }
 
-    void release(RedisConnection *conn)
+    void push_conn(RedisConnection *conn)
     {
         if (!conn)
             return;
-        EnterCriticalSection(&pool_lock);
-        connection_storage_pool.push_back(conn);
-        LeaveCriticalSection(&pool_lock);
+        EnterCriticalSection(&lock);
+        conns.push_back(conn);
+        LeaveCriticalSection(&lock);
     }
 
 public:
     LimiterEngine(std::string redis_ip, int redis_port, int size)
-        : node_ip(redis_ip), node_port(redis_port), max_pool_size(size), circuit_state(CLOSED)
+        : ip(redis_ip), port(redis_port), pool_size(size), state(CLOSED)
     {
-        InitializeCriticalSection(&pool_lock);
-        state_changed_time = std::chrono::steady_clock::now();
+        InitializeCriticalSection(&lock);
+        last_state_change = std::chrono::steady_clock::now();
 
-        for (int i = 0; i < max_pool_size; ++i)
+        for (int i = 0; i < pool_size; ++i)
         {
             RedisConnection *conn = new RedisConnection();
-            if (conn->connect_to_node(node_ip, node_port) && load_scripts(conn))
+            if (conn->connect_to_node(ip, port) && load_scripts(conn))
             {
-                connection_storage_pool.push_back(conn);
+                conns.push_back(conn);
             }
             else
             {
@@ -193,96 +166,95 @@ public:
             }
         }
 
-        RedisConnection *seed_conn = acquire();
-        if (seed_conn)
+        RedisConnection *seed = pop_conn();
+        if (seed)
         {
-            seed_conn->send_resp({"HMSET", "cfg:free", "capacity", "2.0", "refill_rate", "0.1"});
-            seed_conn->read_resp();
-            seed_conn->send_resp({"HMSET", "cfg:vip", "capacity", "10.0", "refill_rate", "5.0"});
-            seed_conn->read_resp();
-            release(seed_conn);
+            seed->send_resp({"HMSET", "cfg:free", "capacity", "2.0", "refill_rate", "0.1"});
+            seed->read_resp();
+            seed->send_resp({"HMSET", "cfg:vip", "capacity", "10.0", "refill_rate", "5.0"});
+            seed->read_resp();
+            push_conn(seed);
         }
     }
 
     ~LimiterEngine()
     {
-        EnterCriticalSection(&pool_lock);
-        for (size_t i = 0; i < connection_storage_pool.size(); ++i)
-        {
-            delete connection_storage_pool[i];
-        }
-        connection_storage_pool.clear();
-        LeaveCriticalSection(&pool_lock);
-        DeleteCriticalSection(&pool_lock);
+        EnterCriticalSection(&lock);
+        for (size_t i = 0; i < conns.size(); ++i)
+            delete conns[i];
+        conns.clear();
+        LeaveCriticalSection(&lock);
+        DeleteCriticalSection(&lock);
     }
 
     bool allow(const std::string &client_id, const std::string &tier)
     {
-        auto now_clock = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
 
-        if (circuit_state == OPEN)
+        // FSM Circuit Breaker Check
+        if (state == OPEN)
         {
-            std::chrono::duration<double> elapsed = now_clock - state_changed_time;
+            std::chrono::duration<double> elapsed = now - last_state_change;
             if (elapsed.count() > 4.0)
             {
-                circuit_state = HALF_OPEN;
-                std::cout << "[STATE TRANSITION] Entering HALF-OPEN Canary Probing State..." << std::endl;
+                state = HALF_OPEN;
+                std::cout << "[CB] HALF-OPEN: Testing cluster health via canary request..." << std::endl;
             }
             else
             {
-                local_cache[client_id].current_tokens++;
-                std::cout << "  [ROUTE: LOCAL FALLBACK MAP] Redis offline. Checking transient bounds..." << std::endl;
-                return (local_cache[client_id].current_tokens <= 5);
+                fallback_cache[client_id].current_tokens++;
+                std::cout << "[CB-FALLBACK] Serving from transient local cache map..." << std::endl;
+                return (fallback_cache[client_id].current_tokens <= 5);
             }
         }
 
-        RedisConnection *conn = acquire();
+        RedisConnection *conn = pop_conn();
         if (!conn)
         {
-            circuit_state = OPEN;
-            state_changed_time = std::chrono::steady_clock::now();
-            std::cout << "[CRITICAL FAILURE] Lost contact with cluster nodes! Tripping Circuit Breaker to OPEN..." << std::endl;
+            state = OPEN;
+            last_state_change = std::chrono::steady_clock::now();
+            std::cout << "[CB-ALERT] Node connection failed. Breaking circuit to OPEN..." << std::endl;
             return allow(client_id, tier);
         }
 
-        long long seconds = std::chrono::duration_cast<std::chrono::seconds>(now_clock.time_since_epoch()).count();
-        conn->send_resp({"EVALSHA", conn->token_bucket_sha, "2", "rate:" + client_id, "cfg:" + tier, std::to_string(seconds)});
+        long long secs = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+        conn->send_resp({"EVALSHA", conn->bucket_sha, "2", "rate:" + client_id, "cfg:" + tier, std::to_string(secs)});
 
         std::string res = conn->read_resp();
-        release(conn);
+        push_conn(conn);
 
         if (res.empty())
         {
-            circuit_state = OPEN;
-            state_changed_time = std::chrono::steady_clock::now();
-            std::cout << "[NETWORK EXCEPTION] Read timeout on transaction pipeline!" << std::endl;
+            state = OPEN;
+            last_state_change = std::chrono::steady_clock::now();
+            std::cout << "[CB-ALERT] Socket read timeout. Circuit tripped to OPEN." << std::endl;
             return allow(client_id, tier);
         }
 
-        if (circuit_state == HALF_OPEN)
+        if (state == HALF_OPEN)
         {
-            circuit_state = CLOSED;
-            std::cout << "[STATE TRANSITION] Canary passed! Circuit self-healed back to CLOSED." << std::endl;
+            state = CLOSED;
+            std::cout << "[CB] Canary passed. Restored circuit to CLOSED." << std::endl;
         }
 
-        std::cout << "  [ROUTE: CENTRAL DISTRIBUTED REDIS] Evaluating metrics via node scripts..." << std::endl;
+        std::cout << "[ENGINE] Evaluated via remote Redis script logic." << std::endl;
         return (res.find(":1") != std::string::npos);
     }
 
     int evaluate_security(const std::string &ip_addr)
     {
-        RedisConnection *conn = acquire();
+        RedisConnection *conn = pop_conn();
         if (!conn)
             return 0;
 
         auto now = std::chrono::steady_clock::now();
         long long secs = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
 
-        conn->send_resp({"EVALSHA", conn->security_sha, "3", "sec:rate:" + ip_addr, "sec:ban:" + ip_addr, "sec:viol:" + ip_addr,
+        conn->send_resp({"EVALSHA", conn->sec_sha, "3", "sec:rate:" + ip_addr, "sec:ban:" + ip_addr, "sec:viol:" + ip_addr,
                          std::to_string(secs), "1.0", "0.01", "3", "10"});
 
         std::string res = conn->read_resp();
-        release(conn);
+        push_conn(conn);
 
         if (res.find(":-1") != std::string::npos)
             return -1;
@@ -293,7 +265,7 @@ public:
 
     void drain_telemetry_queue()
     {
-        RedisConnection *conn = acquire();
+        RedisConnection *conn = pop_conn();
         if (!conn)
             return;
 
@@ -304,49 +276,47 @@ public:
             std::string data = conn->parse_bulk(res);
             if (data.empty() || data.find("ERROR") != std::string::npos)
                 break;
-            std::cout << "   -> [ASYNC TELEM CONSUMER] Stream captured event: " << data << std::endl;
+            std::cout << "   -> [TELEMETRY CONSUMER] Dequeued log event: " << data << std::endl;
         }
-        release(conn);
+        push_conn(conn);
     }
 
     void simulate_network_drop()
     {
-        EnterCriticalSection(&pool_lock);
-        for (size_t i = 0; i < connection_storage_pool.size(); ++i)
+        EnterCriticalSection(&lock);
+        for (size_t i = 0; i < conns.size(); ++i)
         {
-            if (connection_storage_pool[i]->sock != INVALID_SOCKET)
+            if (conns[i]->sock != INVALID_SOCKET)
             {
-                closesocket(connection_storage_pool[i]->sock);
-                connection_storage_pool[i]->sock = INVALID_SOCKET;
+                closesocket(conns[i]->sock);
+                conns[i]->sock = INVALID_SOCKET;
             }
         }
-        std::cout << "\n>>> INJECTING CHAOS: Cutting network cables to Redis cluster... <<<" << std::endl;
-        LeaveCriticalSection(&pool_lock);
+        std::cout << "\n>>> [CHAOS] Dropping network handles to Redis cluster... <<<" << std::endl;
+        LeaveCriticalSection(&lock);
     }
 
     void simulate_network_heal()
     {
-        std::cout << "\n>>> INJECTING HEALING: Restoring hardware cluster nodes... <<<" << std::endl;
-        EnterCriticalSection(&pool_lock);
-        for (size_t i = 0; i < connection_storage_pool.size(); ++i)
-        {
-            delete connection_storage_pool[i];
-        }
-        connection_storage_pool.clear();
+        std::cout << "\n>>> [CHAOS] Re-establishing sockets to cluster... <<<" << std::endl;
+        EnterCriticalSection(&lock);
+        for (size_t i = 0; i < conns.size(); ++i)
+            delete conns[i];
+        conns.clear();
 
-        for (int i = 0; i < max_pool_size; ++i)
+        for (int i = 0; i < pool_size; ++i)
         {
             RedisConnection *conn = new RedisConnection();
-            if (conn->connect_to_node(node_ip, node_port) && load_scripts(conn))
+            if (conn->connect_to_node(ip, port) && load_scripts(conn))
             {
-                connection_storage_pool.push_back(conn);
+                conns.push_back(conn);
             }
             else
             {
                 delete conn;
             }
         }
-        LeaveCriticalSection(&pool_lock);
+        LeaveCriticalSection(&lock);
     }
 };
 

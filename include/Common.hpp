@@ -3,7 +3,6 @@
 
 #include <windows.h>
 
-// Day 27: Circuit Breaker State Machine Enumeration
 enum CircuitState
 {
     CLOSED,
@@ -11,7 +10,7 @@ enum CircuitState
     HALF_OPEN
 };
 
-// Day 28 & 29: Hardware-Optimized, Bit-Packed Client Profile Class
+// 64-byte alignment avoids false sharing on hot CPU cache lines
 class alignas(64) ClientProfile
 {
 private:
@@ -21,7 +20,7 @@ public:
     long long last_updated;
     int current_tokens;
 
-    // Static constant masks
+    // Bit positions for tracking client state
     static const unsigned char MASK_ACTIVE = 0x01;
     static const unsigned char MASK_PREMIUM = 0x02;
     static const unsigned char MASK_BANNED = 0x04;
