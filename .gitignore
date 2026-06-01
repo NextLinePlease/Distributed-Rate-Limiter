@@ -1,0 +1,5 @@
+production_engine.exe
+*.exe
+*.o
+.vscode/
+compile.bat
