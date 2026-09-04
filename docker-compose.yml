@@ -1,0 +1,48 @@
+services:
+  redis_store:
+    image: redis:7
+    container_name: d_rate_limiter_redis
+    ports:
+      - "6379:6379"
+    networks:
+      - rate_limit_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  rate_limiter_app:
+    build: .
+    container_name: d_rate_limiter_app
+    depends_on:
+      redis_store:
+        condition: service_healthy
+    environment:
+      - REDIS_HOST=redis_store
+      - REDIS_PORT=6379
+    networks:
+      - rate_limit_network
+
+  fastapi_gateway:
+    build: ./gateway
+    container_name: d_fastapi_gateway
+    ports:
+      - "8000:8000"
+    depends_on:
+      - rate_limiter_app
+    networks:
+      - rate_limit_network
+
+  etl_pipeline:
+    build: ./gateway
+    container_name: d_etl_pipeline
+    command: ["python", "etl.py"]
+    depends_on:
+      - redis_store
+    networks:
+      - rate_limit_network
+
+networks:
+  rate_limit_network:
+    driver: bridge

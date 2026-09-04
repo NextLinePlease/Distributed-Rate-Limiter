@@ -1,0 +1,19 @@
+# Build directories
+build/
+bin/
+obj/
+
+# VS Code settings
+.vscode/
+
+# Docker overrides / state
+.docker/
+*.log
+
+# Windows metadata
+Thumbs.db
+Desktop.ini
+*.exe
+*.dll
+*.so
+*.dylib
