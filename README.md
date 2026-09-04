@@ -8,7 +8,7 @@
 
 A production-grade, highly concurrent, distributed rate-limiting infrastructure framework built from scratch in C++17, backed by a FastAPI ingress gateway, Redis state cluster, and an asynchronous Python ETL logging pipeline.
 
-![Distributed Rate Limiter Architecture & Request Flow](architecture.jpg)
+![Distributed Rate Limiter Architecture & Request Flow](assets/architecture.jpg)
 
 ---
 
