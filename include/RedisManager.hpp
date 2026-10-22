@@ -5,28 +5,31 @@
 #include <memory>
 #include <atomic>
 
-// CIRCUIT BREAKER FSM STATES
+// Represents the Redis connection circuit condition.
 enum class CircuitState
 {
     CLOSED,   // Redis is healthy
-    OPEN,     // Redis is dead, failing open to local cache
-    HALF_OPEN // Testing Redis recovery
+    OPEN,     // Redis calls are blocked after repeated failures
+    HALF_OPEN // A request can probe whether Redis has recovered
 };
 
+// Provides the shared Redis client and tracks connection health.
 class RedisManager
 {
 public:
+    // Returns the process-wide Redis manager instance.
     static RedisManager &getInstance();
 
-    // Restored the exact signature expected by the .cpp files
+    // Returns the shared Redis client used by the limiter implementations.
     std::shared_ptr<sw::redis::Redis> getClient();
 
-    // Inline Circuit Breaker implementations to prevent linker errors
+    // Reads the current breaker state without locking.
     CircuitState getCircuitState() const
     {
         return state_.load(std::memory_order_relaxed);
     }
 
+    // Counts a Redis failure and opens the breaker after the threshold.
     void reportFailure()
     {
         if (failure_count_.fetch_add(1, std::memory_order_relaxed) > 3)
@@ -35,6 +38,7 @@ public:
         }
     }
 
+    // Clears the failure count and closes the breaker after success.
     void reportSuccess()
     {
         failure_count_.store(0, std::memory_order_relaxed);
@@ -42,12 +46,13 @@ public:
     }
 
 private:
+    // Creates and initializes the Redis connection pool.
     RedisManager();
 
-    // Restored the exact variable name expected by RedisManager.cpp
+    // Shares the configured Redis client across limiter calls.
     std::shared_ptr<sw::redis::Redis> redis_client_;
 
-    // Thread-safe FSM tracking
+    // Stores breaker state and consecutive failure count atomically.
     std::atomic<CircuitState> state_{CircuitState::CLOSED};
     std::atomic<int> failure_count_{0};
 };

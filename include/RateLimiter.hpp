@@ -4,23 +4,27 @@
 #include <string>
 #include <cstdint>
 
-// HARDWARE OPTIMIZATION: 64-byte cache-line alignment prevents false sharing
-// across multi-core CPU threads during high-concurrency loops.
+// Returns the decision and quota details for one rate-limit check.
 struct alignas(64) RateLimitResult
 {
-    // BIT-PACKING: Compressing 3 distinct boolean/state flags into a single byte
+    // Packs the allow/fallback flags and tier value into one bit-field group.
     bool allowed : 1;
     bool is_fallback : 1;
     uint8_t tier_level : 6;
 
+    // Reports the remaining quota and wait time before retrying.
     int64_t remaining_quota;
     int64_t retry_after_ms;
 };
 
+// Defines the common interface implemented by each limiter algorithm.
 class RateLimiter
 {
 public:
+    // Allows cleanup through a pointer to the base interface.
     virtual ~RateLimiter() = default;
+
+    // Checks whether a client may consume the requested quota cost.
     virtual RateLimitResult allow(const std::string &client_id, int64_t cost = 1) = 0;
 };
 

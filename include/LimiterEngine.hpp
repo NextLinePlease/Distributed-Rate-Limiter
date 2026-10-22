@@ -11,22 +11,27 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
+// Owns one socket connection to Redis and its cached script identifiers.
 class RedisConnection
 {
 public:
+    // Stores the socket and SHA identifiers for the loaded Redis scripts.
     SOCKET sock;
     std::string bucket_sha;
     std::string sec_sha;
     std::string telem_sha;
 
+    // Starts with no socket and no loaded script identifiers.
     RedisConnection() : sock(INVALID_SOCKET), bucket_sha(""), sec_sha(""), telem_sha("") {}
 
+    // Closes the socket when this connection object is destroyed.
     ~RedisConnection()
     {
         if (sock != INVALID_SOCKET)
             closesocket(sock);
     }
 
+    // Opens a TCP connection to the configured Redis host and port.
     bool connect_to_node(const std::string &ip, int port)
     {
         sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -39,6 +44,7 @@ public:
         return (connect(sock, (SOCKADDR *)&addr, sizeof(addr)) != SOCKET_ERROR);
     }
 
+    // Sends a Redis command encoded as a RESP array of bulk strings.
     void send_resp(const std::vector<std::string> &args)
     {
         std::string req = "*" + std::to_string(args.size()) + "\r\n";
@@ -49,6 +55,7 @@ public:
         send(sock, req.c_str(), req.length(), 0);
     }
 
+    // Reads one response chunk from the Redis socket.
     std::string read_resp()
     {
         char buf[1024] = {0};
@@ -56,6 +63,7 @@ public:
         return (bytes > 0) ? std::string(buf, bytes) : "";
     }
 
+    // Extracts a bulk-string payload from a Redis response.
     std::string parse_bulk(const std::string &resp)
     {
         if (resp.empty() || resp[0] != '$')
@@ -70,24 +78,31 @@ public:
     }
 };
 
+// Manages Redis connections, limiter scripts, and local fallback state.
 class LimiterEngine
 {
 private:
+    // Stores Redis endpoint settings and the available connection pool.
     std::string ip;
     int port;
     int pool_size;
     std::vector<RedisConnection *> conns;
     CRITICAL_SECTION lock;
 
+    // Tracks circuit-breaker status and the time of its last transition.
     CircuitState state;
     std::chrono::steady_clock::time_point last_state_change;
+
+    // Holds per-client fallback state while Redis is unavailable.
     std::unordered_map<std::string, ClientProfile> fallback_cache;
 
+    // Loads the bucket, security, and telemetry scripts for one connection.
     bool load_scripts(RedisConnection *conn)
     {
         if (!conn)
             return false;
 
+        // Atomically refills and consumes tokens for the configured tier.
         std::string lua_bucket =
             "local k,c=KEYS[1],KEYS[2] local cfg=redis.call('HMGET',c,'capacity','refill_rate') "
             "local cap,rate=tonumber(cfg[1]) or 2.0,tonumber(cfg[2]) or 0.1 local now=tonumber(ARGV[1]) "
@@ -96,6 +111,7 @@ private:
             "if t>=1.0 then redis.call('HMSET',k,'tokens',t-1.0,'last_updated',now) redis.call('EXPIRE',k,60) return 1 "
             "else redis.call('HMSET',k,'tokens',t,'last_updated',now) return 0 end";
 
+        // Tracks repeated violations and temporarily bans abusive clients.
         std::string lua_sec =
             "local r,b,v=KEYS[1],KEYS[2],KEYS[3] local now,cap,rate,th,dur=tonumber(ARGV[1]),tonumber(ARGV[2]),tonumber(ARGV[3]),tonumber(ARGV[4]),tonumber(ARGV[5]) "
             "if redis.call('EXISTS',b)==1 then return -1 end local d=redis.call('HMGET',r,'tokens','last_updated') "
@@ -104,6 +120,7 @@ private:
             "else redis.call('HMSET',r,'tokens',t,'last_updated',now) local viols=redis.call('INCR',v) redis.call('EXPIRE',v,20) "
             "if viols>=th then redis.call('SET',b,'1') redis.call('EXPIRE',b,dur) redis.call('DEL',v) return -1 end return 0 end";
 
+        // Records bounded limiter events in a Redis list for later consumption.
         std::string lua_telem =
             "local r,q=KEYS[1],KEYS[2] local cid,now,cap,rate=ARGV[1],tonumber(ARGV[2]),tonumber(ARGV[3]),tonumber(ARGV[4]) "
             "local d=redis.call('HMGET',r,'tokens','last_updated') local t,lu=tonumber(d[1]) or cap,tonumber(d[2]) or now "
@@ -111,6 +128,7 @@ private:
             "if t>=1.0 then t=t-1.0 status='ALLOWED' ret=1 end redis.call('HMSET',r,'tokens',t,'last_updated',now) "
             "redis.call('LPUSH',q,now..','..cid..','..status) redis.call('LTRIM',q,0,999) return ret";
 
+        // Loads each script and stores its Redis-generated SHA.
         conn->send_resp({"SCRIPT", "LOAD", lua_bucket});
         conn->bucket_sha = conn->parse_bulk(conn->read_resp());
 
@@ -123,6 +141,7 @@ private:
         return (!conn->bucket_sha.empty() && !conn->sec_sha.empty() && !conn->telem_sha.empty());
     }
 
+    // Checks out one connection unless the pool is empty or the breaker is open.
     RedisConnection *pop_conn()
     {
         EnterCriticalSection(&lock);
@@ -137,6 +156,7 @@ private:
         return conn;
     }
 
+    // Returns a checked-out connection to the shared pool.
     void push_conn(RedisConnection *conn)
     {
         if (!conn)
@@ -147,6 +167,7 @@ private:
     }
 
 public:
+    // Connects to Redis, loads scripts, and seeds default rate-limit tiers.
     LimiterEngine(std::string redis_ip, int redis_port, int size)
         : ip(redis_ip), port(redis_port), pool_size(size), state(CLOSED)
     {
@@ -177,6 +198,7 @@ public:
         }
     }
 
+    // Releases pooled Redis connections and the synchronization primitive.
     ~LimiterEngine()
     {
         EnterCriticalSection(&lock);
@@ -187,11 +209,12 @@ public:
         DeleteCriticalSection(&lock);
     }
 
+    // Allows or rejects a client request using the selected Redis tier.
     bool allow(const std::string &client_id, const std::string &tier)
     {
         auto now = std::chrono::steady_clock::now();
 
-        // FSM Circuit Breaker Check
+        // Uses local state while open, then probes Redis after the cooldown.
         if (state == OPEN)
         {
             std::chrono::duration<double> elapsed = now - last_state_change;
@@ -217,6 +240,7 @@ public:
             return allow(client_id, tier);
         }
 
+        // Sends the rate-limit decision to the atomic Redis bucket script.
         long long secs = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
         conn->send_resp({"EVALSHA", conn->bucket_sha, "2", "rate:" + client_id, "cfg:" + tier, std::to_string(secs)});
 
@@ -241,6 +265,7 @@ public:
         return (res.find(":1") != std::string::npos);
     }
 
+    // Returns 1 for allowed, 0 for rejected, or -1 for a banned client.
     int evaluate_security(const std::string &ip_addr)
     {
         RedisConnection *conn = pop_conn();
@@ -263,6 +288,7 @@ public:
         return 0;
     }
 
+    // Removes and prints telemetry entries until the Redis list is empty.
     void drain_telemetry_queue()
     {
         RedisConnection *conn = pop_conn();
@@ -281,6 +307,7 @@ public:
         push_conn(conn);
     }
 
+    // Closes pooled sockets to simulate a Redis network outage.
     void simulate_network_drop()
     {
         EnterCriticalSection(&lock);
@@ -296,6 +323,7 @@ public:
         LeaveCriticalSection(&lock);
     }
 
+    // Recreates the Redis sockets and reloads their Lua scripts.
     void simulate_network_heal()
     {
         std::cout << "\n>>> [CHAOS] Re-establishing sockets to cluster... <<<" << std::endl;
