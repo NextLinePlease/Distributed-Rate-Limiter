@@ -54,3 +54,14 @@ Ensure you have **Docker** and **Docker Compose** installed on your machine.
 ```bash
 git clone [https://github.com/NextLinePlease/Distributed-Rate-Limiter.git](https://github.com/NextLinePlease/Distributed-Rate-Limiter.git)
 cd Distributed-Rate-Limiter
+```
+
+### Gateway health and degraded-mode controls
+The FastAPI gateway now exposes a lightweight health endpoint and includes request-tracing headers during normal and fallback operation:
+
+```bash
+curl http://localhost:8000/health
+curl http://localhost:8000/metrics
+```
+
+When the upstream C++ limiter or Redis becomes unavailable, the gateway automatically enters a short local fallback window and emits `X-Request-ID`, `X-RateLimit-Remaining`, and `Retry-After` metadata to keep client behavior stable.

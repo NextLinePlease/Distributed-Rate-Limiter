@@ -53,25 +53,49 @@ void TokenBucketLimiter::loadLuaScript()
 
 RateLimitResult TokenBucketLimiter::allow(const std::string &client_id, int64_t cost)
 {
-    auto redis = RedisManager::getInstance().getClient();
-
-    auto now_chrono = std::chrono::system_clock::now();
-    double now = std::chrono::duration<double>(now_chrono.time_since_epoch()).count();
-
-    std::string key = "rl:tb:" + client_id;
-    std::vector<std::string> keys = {key};
-    std::vector<std::string> args = {
-        std::to_string(capacity_),
-        std::to_string(refill_rate_per_sec_),
-        std::to_string(now),
-        std::to_string(cost)};
-
-    std::vector<long long> result;
-    redis->evalsha(script_sha_, keys.begin(), keys.end(), args.begin(), args.end(), std::back_inserter(result));
-
     RateLimitResult res;
-    res.allowed = (result[0] == 1);
-    res.remaining_quota = result[1];
-    res.retry_after_ms = res.allowed ? 0 : 1000;
-    return res;
+    auto &redis_manager = RedisManager::getInstance();
+
+    if (redis_manager.shouldUseFallback() || !redis_manager.getClient())
+    {
+        res.is_fallback = true;
+        res.allowed = true;
+        res.remaining_quota = capacity_;
+        res.retry_after_ms = 0;
+        return res;
+    }
+
+    try
+    {
+        auto redis = redis_manager.getClient();
+
+        auto now_chrono = std::chrono::system_clock::now();
+        double now = std::chrono::duration<double>(now_chrono.time_since_epoch()).count();
+
+        std::string key = "rl:tb:" + client_id;
+        std::vector<std::string> keys = {key};
+        std::vector<std::string> args = {
+            std::to_string(capacity_),
+            std::to_string(refill_rate_per_sec_),
+            std::to_string(now),
+            std::to_string(cost)};
+
+        std::vector<long long> result;
+        redis->evalsha(script_sha_, keys.begin(), keys.end(), args.begin(), args.end(), std::back_inserter(result));
+
+        res.allowed = (result[0] == 1);
+        res.remaining_quota = result[1];
+        res.retry_after_ms = res.allowed ? 0 : static_cast<int64_t>(std::max(1.0, 1000.0 / refill_rate_per_sec_));
+        redis_manager.reportSuccess();
+        return res;
+    }
+    catch (const sw::redis::Error &)
+    {
+        redis_manager.reportFailure();
+        res.is_fallback = true;
+        res.allowed = true;
+        res.remaining_quota = capacity_;
+        res.retry_after_ms = 0;
+        return res;
+    }
 }

@@ -4,6 +4,11 @@
 #include <sw/redis++/redis++.h>
 #include <memory>
 #include <atomic>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <chrono>
 
 // Represents the Redis connection circuit condition.
 enum class CircuitState
@@ -29,10 +34,16 @@ public:
         return state_.load(std::memory_order_relaxed);
     }
 
+    // Determines whether the system should switch to local fallback behavior.
+    bool shouldUseFallback() const
+    {
+        return state_.load(std::memory_order_relaxed) != CircuitState::CLOSED;
+    }
+
     // Counts a Redis failure and opens the breaker after the threshold.
     void reportFailure()
     {
-        if (failure_count_.fetch_add(1, std::memory_order_relaxed) > 3)
+        if (failure_count_.fetch_add(1, std::memory_order_relaxed) >= 3)
         {
             state_.store(CircuitState::OPEN, std::memory_order_release);
         }
@@ -43,6 +54,31 @@ public:
     {
         failure_count_.store(0, std::memory_order_relaxed);
         state_.store(CircuitState::CLOSED, std::memory_order_release);
+    }
+
+    // Attempts a lightweight health probe to confirm Redis is still reachable.
+    bool ping()
+    {
+        try
+        {
+            if (!redis_client_)
+            {
+                return false;
+            }
+
+            auto response = redis_client_->ping();
+            if (response == "PONG")
+            {
+                reportSuccess();
+                return true;
+            }
+        }
+        catch (const sw::redis::Error &)
+        {
+            reportFailure();
+        }
+
+        return false;
     }
 
 private:

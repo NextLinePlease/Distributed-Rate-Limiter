@@ -15,6 +15,11 @@ struct alignas(64) RateLimitResult
     // Reports the remaining quota and wait time before retrying.
     int64_t remaining_quota;
     int64_t retry_after_ms;
+
+    RateLimitResult()
+        : allowed(false), is_fallback(false), tier_level(0), remaining_quota(0), retry_after_ms(0)
+    {
+    }
 };
 
 // Defines the common interface implemented by each limiter algorithm.
