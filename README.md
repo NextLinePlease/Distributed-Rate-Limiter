@@ -56,12 +56,14 @@ git clone [https://github.com/NextLinePlease/Distributed-Rate-Limiter.git](https
 cd Distributed-Rate-Limiter
 ```
 
-### Gateway health and degraded-mode controls
-The FastAPI gateway now exposes a lightweight health endpoint and includes request-tracing headers during normal and fallback operation:
+### Gateway health and live telemetry
+The FastAPI gateway exposes health and live telemetry endpoints:
 
 ```bash
 curl http://localhost:8000/health
 curl http://localhost:8000/metrics
 ```
 
-When the upstream C++ limiter or Redis becomes unavailable, the gateway automatically enters a short local fallback window and emits `X-Request-ID`, `X-RateLimit-Remaining`, and `Retry-After` metadata to keep client behavior stable.
+`/metrics` reports distributed request/decision counters, response-time totals, counters grouped by a privacy-preserving client hash, gateway-local fallback counts, and ETL audit summaries. Client breakdowns are capped at 100 entries per response; telemetry expires from Redis after 24 hours. Rate-limit violations are processed asynchronously and the latest audit event is available in the response.
+
+When the upstream C++ limiter or Redis becomes unavailable, the gateway automatically enters a short local fallback window and emits `X-Request-ID`, `X-RateLimit-Remaining`, `X-RateLimit-Fallback`, and `Retry-After` metadata to keep client behavior stable.

@@ -31,6 +31,7 @@ int main()
             
             // Attach telemetry headers
             res.set_header("X-RateLimit-Remaining", std::to_string(result.remaining_quota));
+            res.set_header("X-RateLimit-Fallback", result.is_fallback ? "true" : "false");
             
             if (result.allowed) {
                 res.status = 200;
